@@ -726,3 +726,88 @@ class TestSessionHostRequests:
         await host.aclose()
         unsubscribed = {call.args[0] for call in session.off.call_args_list}
         assert unsubscribed == FORWARDED_EVENTS
+
+
+class TestSessionHostSimulationHold:
+    """A simulated session's channel outlives the session until the simulator finalizes."""
+
+    @pytest.fixture
+    def transport(self) -> InMemoryTransport:
+        return InMemoryTransport()
+
+    @pytest.fixture
+    def simulated_job(self, monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+        sim_ctx = MagicMock()
+        sim_ctx.user_verdict = None
+        job_ctx = MagicMock()
+        job_ctx.simulation_context = MagicMock(return_value=sim_ctx)
+        job_ctx._simulation_end_fnc = None
+        monkeypatch.setattr("livekit.agents.job.get_job_context", lambda required=True: job_ctx)
+        return job_ctx
+
+    async def _started_host(self, transport: InMemoryTransport) -> SessionHost:
+        host = SessionHost(transport)
+        host.register_session(TestSessionHostRequests()._make_mock_session())
+        await host.start()
+        return host
+
+    @pytest.mark.asyncio
+    async def test_hold_ends_once_finalize_is_answered(
+        self, transport: InMemoryTransport, simulated_job: MagicMock
+    ) -> None:
+        host = await self._started_host(transport)
+        hold = asyncio.ensure_future(host.hold_for_simulation_finalize())
+        await asyncio.sleep(1.0)
+        assert not hold.done()
+
+        await host._handle_request(
+            agent_pb.SessionRequest(
+                request_id="req-fin",
+                finalize_simulation=agent_pb.SessionRequest.FinalizeSimulation(
+                    provisional_success=True
+                ),
+            )
+        )
+        await asyncio.wait_for(hold, timeout=0.1)
+
+        assert transport.sent[-1].response.request_id == "req-fin"
+        assert transport.sent[-1].response.HasField("finalize_simulation")
+        await host.aclose()
+
+    @pytest.mark.asyncio
+    async def test_run_input_after_end_releases_unanswered(
+        self, transport: InMemoryTransport, simulated_job: MagicMock
+    ) -> None:
+        host = await self._started_host(transport)
+        hold = asyncio.ensure_future(host.hold_for_simulation_finalize())
+        await asyncio.sleep(0)
+
+        await host._handle_request(
+            agent_pb.SessionRequest(
+                request_id="req-run", run_input=agent_pb.SessionRequest.RunInput(text="hello?")
+            )
+        )
+        await asyncio.wait_for(hold, timeout=0.1)
+
+        assert transport.sent == []
+        await host.aclose()
+
+    @pytest.mark.asyncio
+    async def test_hold_gives_up_after_timeout(
+        self, transport: InMemoryTransport, simulated_job: MagicMock
+    ) -> None:
+        host = await self._started_host(transport)
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        await host.hold_for_simulation_finalize()
+        assert loop.time() - started == pytest.approx(10.0, abs=0.5)
+        await host.aclose()
+
+    @pytest.mark.asyncio
+    async def test_no_hold_outside_a_simulation(
+        self, transport: InMemoryTransport, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("livekit.agents.job.get_job_context", lambda required=True: None)
+        host = await self._started_host(transport)
+        await asyncio.wait_for(host.hold_for_simulation_finalize(), timeout=0.1)
+        await host.aclose()

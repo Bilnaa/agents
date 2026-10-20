@@ -1330,6 +1330,11 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
                 self.emit("close", CloseEvent(error=error, reason=reason))
 
                 if self._session_host:
+                    if reason == CloseReason.USER_INITIATED:
+                        # only an agent ending its own session leaves the simulator yet
+                        # to finalize; a job shutdown has to stay within the supervisor's
+                        # shutdown_process_timeout
+                        await self._session_host.hold_for_simulation_finalize()
                     await self._session_host.aclose()
                     self._session_host = None
 

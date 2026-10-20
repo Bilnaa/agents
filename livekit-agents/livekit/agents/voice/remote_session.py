@@ -62,6 +62,8 @@ TOPIC_SESSION_MESSAGES = "lk.agent.session"
 # before cancelling them. Stays well under the worker's shutdown_process_timeout
 # (10s by default), which has to cover this plus the rest of session cleanup.
 _SHUTDOWN_DRAIN_TIMEOUT = 3.0
+# the simulator judges the run (a few LLM calls) before it sends finalize_simulation
+_SIMULATION_FINALIZE_TIMEOUT = 10.0
 
 
 async def _drain(tasks: set[asyncio.Task[Any]], deadline: float) -> set[asyncio.Task[Any]]:
@@ -354,6 +356,9 @@ class SessionHost:
         # register_session() and start() queue up instead of being dropped.
         self._event_ch = utils.aio.Chan[agent_pb.AgentSessionMessage]()
         self._write_task: asyncio.Task[None] | None = None
+        # set once the simulator no longer needs this channel after the session ends
+        self._simulation_released = asyncio.Event()
+        self._session_ended = False
 
     def register_session(self, session: AgentSession) -> None:
         self._session = session
@@ -380,6 +385,22 @@ class SessionHost:
             self._write_loop(self._event_ch), name="SessionHost._write_loop"
         )
         self._recv_task = asyncio.create_task(self._recv_loop())
+
+    async def hold_for_simulation_finalize(self) -> None:
+        """Under a simulation, keep serving requests past the session's end until the
+        simulator finalizes: it asks for the on_simulation_end verdict only after the
+        run is over, which an agent ending the call is."""
+        from ..job import get_job_context
+
+        job_ctx = get_job_context(required=False)
+        if job_ctx is None or job_ctx.simulation_context() is None:
+            return
+
+        self._session_ended = True
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(
+                self._simulation_released.wait(), timeout=_SIMULATION_FINALIZE_TIMEOUT
+            )
 
     async def aclose(self) -> None:
         if not self._started:
@@ -758,6 +779,11 @@ class SessionHost:
             )
             await self._transport.send_message(resp)
 
+        elif req.HasField("run_input") and self._session_ended:
+            # the simulator is still driving turns and has yet to notice the call ended;
+            # leaving unanswered is how it learns, and an error would read as an agent fault
+            self._simulation_released.set()
+
         elif req.HasField("run_input"):
             items_list: list[agent_pb.ChatContext.ChatItem] = []
             error: str | None = None
@@ -957,6 +983,7 @@ class SessionHost:
                 )
             )
             await self._transport.send_message(resp)
+            self._simulation_released.set()
 
 
 RemoteSessionEventTypes = Literal[
